@@ -1,0 +1,148 @@
+/* ============================================================================
+   Zoho Flow — "Custom Function" step (Deluge)
+   Blackbaud SKY API gift webhook -> fetch full gift + donor -> upsert into
+   Zoho CRM custom "Donations" module.
+
+   IMPORTANT CONTEXT:
+   A Blackbaud SKY API webhook payload is a THIN NOTIFICATION. It tells you an
+   event happened and gives you a gift id — NOT the full gift data. So this
+   function must call back into the SKY API to read the gift, then read the
+   constituent (donor), then write to Zoho CRM.
+
+   This script is meant to run as a Custom Function (Deluge) action inside a
+   Zoho Flow whose TRIGGER is a Webhook (the URL you registered with Blackbaud).
+   The Flow passes the webhook's gift id into this function as the argument
+   `giftId` (string).
+
+   PARAMETERS to configure on the Zoho Flow Custom Function:
+     giftId  (string)  <- map from the webhook payload's gift id field
+
+   PREREQUISITES:
+   1. A SKY API connection. Easiest in Deluge: create a Connection
+      (Setup > Developer Space > Connections) named `blackbaud_conn` using
+      Blackbaud's OAuth2, with scope for the Gift + Constituent read APIs.
+      You ALSO need the Bb-Api-Subscription-Key header on every SKY call.
+   2. Custom module "Donations" in Zoho CRM with Blackbaud_Gift_ID marked Unique.
+   ========================================================================== */
+
+// ---- config ----
+subscriptionKey = "REPLACE_WITH_YOUR_BB_API_SUBSCRIPTION_KEY"; // better: store in an Org Variable
+skyBase = "https://api.sky.blackbaud.com";
+
+if(giftId == null || giftId == "")
+{
+	info "No giftId supplied; nothing to do.";
+	return;
+}
+
+// ---- 1) Read the full gift from SKY API ----
+giftResp = invokeurl
+[
+	url: skyBase + "/gift/v1/gifts/" + giftId
+	type: GET
+	headers: {"Bb-Api-Subscription-Key": subscriptionKey}
+	connection: "blackbaud_conn"
+];
+
+if(giftResp == null)
+{
+	info "Gift fetch returned null for id " + giftId;
+	return;
+}
+
+// Gift amount in RE NXT is usually an object: {"value": 100.00}
+amountObj = giftResp.get("amount");
+amount = null;
+if(amountObj != null)
+{
+	if(amountObj.containKey("value"))
+	{
+		amount = amountObj.get("value");
+	}
+	else
+	{
+		amount = amountObj;
+	}
+}
+
+giftDate = giftResp.get("date");
+giftType = giftResp.get("type");
+giftStatus = giftResp.get("gift_status");
+
+// The donor (constituent) id. RE NXT exposes it as constituent_id on the gift.
+constituentId = giftResp.get("constituent_id");
+
+// ---- 2) Read the donor (constituent) from SKY API ----
+donorFirst = null;
+donorLast = null;
+donorEmail = null;
+donorName = null;
+
+if(constituentId != null)
+{
+	conResp = invokeurl
+	[
+		url: skyBase + "/constituent/v1/constituents/" + constituentId
+		type: GET
+		headers: {"Bb-Api-Subscription-Key": subscriptionKey}
+		connection: "blackbaud_conn"
+	];
+	if(conResp != null)
+	{
+		donorFirst = conResp.get("first");
+		donorLast = conResp.get("last");
+		donorName = conResp.get("name");
+		// Email often needs a separate call (/constituent/v1/constituents/{id}/emailaddresses);
+		// if the summary includes a primary email, use it:
+		emailObj = conResp.get("email");
+		if(emailObj != null)
+		{
+			donorEmail = emailObj.get("address");
+		}
+	}
+}
+
+// ---- 3) Build the Zoho record ----
+rec = Map();
+rec.put("Name", "Gift " + giftId);
+rec.put("Blackbaud_Gift_ID", giftId.toString());
+if(amount != null)
+{
+	rec.put("Amount", amount);
+}
+if(giftDate != null)
+{
+	rec.put("Donation_Date", giftDate);
+}
+if(giftType != null)
+{
+	rec.put("Gift_Type", giftType);
+}
+if(giftStatus != null)
+{
+	rec.put("Donation_Status", giftStatus);
+}
+if(constituentId != null)
+{
+	rec.put("Constituent_ID", constituentId.toString());
+}
+if(donorFirst != null)
+{
+	rec.put("Donor_First_Name", donorFirst);
+}
+if(donorLast != null)
+{
+	rec.put("Donor_Last_Name", donorLast);
+}
+if(donorName != null)
+{
+	rec.put("Donor_Name", donorName);
+}
+if(donorEmail != null)
+{
+	rec.put("Donor_Email", donorEmail);
+}
+
+// ---- 4) Upsert into Zoho CRM (dedupe on Blackbaud_Gift_ID) ----
+upsertResp = zoho.crm.upsert("Donations", rec, list("Blackbaud_Gift_ID"));
+info "Upsert result: " + upsertResp;

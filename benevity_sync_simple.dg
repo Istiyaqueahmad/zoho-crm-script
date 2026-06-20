@@ -1,0 +1,228 @@
+/* ============================================================================
+   Benevity Giving API (postpaid donations) -> Zoho CRM custom "Donations" module
+   SIMPLE VERSION — scheduled custom function, processes all pages in one run.
+
+   Use this if your donation volume is small enough to finish inside the
+   function execution-time limit. For large volumes use the resumable version.
+
+   SETUP (do these once, in Zoho CRM):
+   1. Setup > Developer Space > Connections > Create Connection
+        - Pick "Custom Service" (or an OAuth2 service if Benevity gives you one).
+        - Name the connection link name exactly:  benevity_conn
+        - Add the Authorization header / token there so it is NOT in this code.
+        (If Benevity only gives a static bearer token, you can instead store it
+         in a Connection that injects the "Authorization: Bearer ..." header.)
+   2. Create the custom module "Donations" with the field API names used in
+      buildRecord() below. Mark Benevity_Donation_ID as a UNIQUE field.
+   3. Setup > Automation > Actions > Functions > New Function (standalone).
+        Paste this script. Save. Then schedule it (Schedules) at your cadence.
+   ========================================================================== */
+
+baseUrl = "https://api.benevity.org";   // adjust if your Benevity host differs
+pageSize = 100;
+
+// Optional status filter; leave blank to pull all statuses.
+statusFilter = "";   // e.g. "COMPLETED"
+
+// Build the first page URL.
+nextUrl = baseUrl + "/donations?page[size]=" + pageSize;
+if(statusFilter != "")
+{
+	nextUrl = nextUrl + "&filter[status]=" + statusFilter;
+}
+
+totalFetched = 0;
+totalUpserted = 0;
+pageNo = 0;
+
+// Walk cursor pages until there is no "next" link.
+while(nextUrl != null && nextUrl != "")
+{
+	pageNo = pageNo + 1;
+
+	// The Benevity bearer token is injected by the "benevity_conn" connection,
+	// so we do not put any secret in this script.
+	resp = invokeurl
+	[
+		url: nextUrl
+		type: GET
+		connection: "benevity_conn"
+	];
+
+	donations = ifnull(resp.get("data"), List());
+	info "Page " + pageNo + ": " + donations.size() + " donation(s)";
+
+	// Collect a batch of mapped records for this page.
+	batch = List();
+	for each d in donations
+	{
+		rec = buildRecord(d);
+		if(rec.get("Benevity_Donation_ID") != null)
+		{
+			batch.add(rec);
+		}
+		totalFetched = totalFetched + 1;
+	}
+
+	// Upsert this page's records into the custom module.
+	if(batch.size() > 0)
+	{
+		upsertResp = zoho.crm.bulkUpsert("Donations", batch, list("Benevity_Donation_ID"));
+		// bulkUpsert returns details per record; count successes loosely.
+		totalUpserted = totalUpserted + batch.size();
+		info "Upserted page " + pageNo + " (" + batch.size() + " records).";
+	}
+
+	// Find the cursor "next" link for the following page.
+	links = ifnull(resp.get("links"), Map());
+	nextLink = links.get("next");
+	if(nextLink == null)
+	{
+		nextLink = links.get("after");
+	}
+	// Some APIs nest the link as {"href": "..."}.
+	if(nextLink != null && nextLink.contains("href"))
+	{
+		nextLink = nextLink.get("href");
+	}
+	nextUrl = nextLink;
+}
+
+info "DONE. Fetched=" + totalFetched + " Upserted=" + totalUpserted;
+
+
+/* ----------------------------------------------------------------------------
+   Map one Benevity donation object to your custom-module field API names.
+   Benevity field shapes vary by account/version, so we probe a few common
+   locations. ADJUST the left-hand Zoho field API names to match your module.
+   --------------------------------------------------------------------------*/
+Map buildRecord(Map d)
+{
+	// JSON:API style nests real fields under "attributes"; flat style does not.
+	attrs = ifnull(d.get("attributes"), d);
+
+	donationId = d.get("id");
+	if(donationId == null)
+	{
+		donationId = attrs.get("id");
+	}
+	if(donationId == null)
+	{
+		donationId = attrs.get("donationId");
+	}
+
+	// Amount + currency (nested object or flat).
+	amount = null;
+	currency = null;
+	amtObj = attrs.get("amount");
+	if(amtObj != null && amtObj.containKey("value"))
+	{
+		amount = amtObj.get("value");
+		currency = amtObj.get("currency");
+	}
+	else
+	{
+		amount = ifnull(attrs.get("donationAmount"), attrs.get("amount"));
+		currency = ifnull(attrs.get("currency"), attrs.get("currencyCode"));
+	}
+
+	// Status.
+	status = null;
+	stateObj = attrs.get("state");
+	if(stateObj != null && stateObj.containKey("processingStatus"))
+	{
+		status = stateObj.get("processingStatus");
+	}
+	else
+	{
+		status = ifnull(attrs.get("status"), attrs.get("processingStatus"));
+	}
+
+	// Date.
+	donationDate = ifnull(attrs.get("createdAt"), ifnull(attrs.get("donationDate"), attrs.get("created")));
+
+	// Cause.
+	causeId = ifnull(attrs.get("recipientId"), attrs.get("causeId"));
+	causeName = null;
+	causeObj = attrs.get("cause");
+	if(causeObj != null)
+	{
+		causeName = causeObj.get("name");
+	}
+	if(causeName == null)
+	{
+		causeName = attrs.get("causeName");
+	}
+
+	// Payment type.
+	paymentType = null;
+	payable = attrs.get("payable");
+	if(payable != null)
+	{
+		paymentType = payable.get("paymentType");
+	}
+	if(paymentType == null)
+	{
+		paymentType = attrs.get("paymentType");
+	}
+
+	// Donor.
+	donor = ifnull(attrs.get("donor"), attrs.get("user"));
+	donorFirst = null;
+	donorLast = null;
+	donorEmail = null;
+	if(donor != null)
+	{
+		donorFirst = ifnull(donor.get("firstName"), donor.get("first_name"));
+		donorLast = ifnull(donor.get("lastName"), donor.get("last_name"));
+		donorEmail = ifnull(donor.get("email"), donor.get("emailAddress"));
+	}
+
+	rec = Map();
+	if(donationId != null)
+	{
+		rec.put("Name", "Donation " + donationId);
+		rec.put("Benevity_Donation_ID", donationId.toString());
+	}
+	if(amount != null)
+	{
+		rec.put("Amount", amount);
+	}
+	if(currency != null)
+	{
+		rec.put("Currency_Code", currency);
+	}
+	if(status != null)
+	{
+		rec.put("Donation_Status", status);
+	}
+	if(donationDate != null)
+	{
+		rec.put("Donation_Date", donationDate);
+	}
+	if(causeId != null)
+	{
+		rec.put("Cause_ID", causeId);
+	}
+	if(causeName != null)
+	{
+		rec.put("Cause_Name", causeName);
+	}
+	if(paymentType != null)
+	{
+		rec.put("Payment_Type", paymentType);
+	}
+	if(donorFirst != null)
+	{
+		rec.put("Donor_First_Name", donorFirst);
+	}
+	if(donorLast != null)
+	{
+		rec.put("Donor_Last_Name", donorLast);
+	}
+	if(donorEmail != null)
+	{
+		rec.put("Donor_Email", donorEmail);
+	}
+	return rec;
+}

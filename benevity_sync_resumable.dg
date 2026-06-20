@@ -1,0 +1,270 @@
+/* ============================================================================
+   Benevity -> Zoho CRM custom "Donations" module
+   RESUMABLE VERSION — processes a bounded number of pages per scheduled run.
+
+   Why: Zoho scheduled functions have a max execution time (a few minutes) and
+   each invokeUrl counts against your external-call limit. If Benevity has many
+   pages of donations, doing them all in one run can time out. This version
+   processes MAX_PAGES_PER_RUN pages, saves the next cursor, and the NEXT
+   scheduled run picks up where this one stopped. Schedule it to run, say,
+   every 15 minutes; it will drain the backlog and then idle.
+
+   STATE STORAGE:
+   We store the saved cursor in a single record of a tiny custom module called
+   "Integration_State" with fields:
+       Name (text)          -> we use the constant "benevity_donations"
+       Cursor_URL (text/url)-> the next page URL to fetch ("" means start over /
+                               nothing pending)
+   Create that module + one record named "benevity_donations" before running,
+   OR adapt loadCursor()/saveCursor() to use Org Variables instead.
+
+   SETUP otherwise identical to the simple version (Connection "benevity_conn",
+   "Donations" module with Benevity_Donation_ID marked Unique).
+   ========================================================================== */
+
+baseUrl = "https://api.benevity.org";
+pageSize = 100;
+statusFilter = "";              // e.g. "COMPLETED"; blank = all
+MAX_PAGES_PER_RUN = 5;          // tune to stay within execution-time limit
+
+stateName = "benevity_donations";
+
+// --- Load the saved cursor (where the previous run stopped). ---
+savedCursor = loadCursor(stateName);
+
+if(savedCursor != null && savedCursor != "")
+{
+	// Resume mid-stream.
+	nextUrl = savedCursor;
+	info "Resuming from saved cursor.";
+}
+else
+{
+	// Fresh pass from page 1.
+	nextUrl = baseUrl + "/donations?page[size]=" + pageSize;
+	if(statusFilter != "")
+	{
+		nextUrl = nextUrl + "&filter[status]=" + statusFilter;
+	}
+	info "Starting a fresh pass.";
+}
+
+pagesThisRun = 0;
+totalFetched = 0;
+
+while(nextUrl != null && nextUrl != "" && pagesThisRun < MAX_PAGES_PER_RUN)
+{
+	pagesThisRun = pagesThisRun + 1;
+
+	resp = invokeurl
+	[
+		url: nextUrl
+		type: GET
+		connection: "benevity_conn"
+	];
+
+	donations = ifnull(resp.get("data"), List());
+	info "Run-page " + pagesThisRun + ": " + donations.size() + " donation(s)";
+
+	batch = List();
+	for each d in donations
+	{
+		rec = buildRecord(d);
+		if(rec.get("Benevity_Donation_ID") != null)
+		{
+			batch.add(rec);
+		}
+		totalFetched = totalFetched + 1;
+	}
+
+	if(batch.size() > 0)
+	{
+		zoho.crm.bulkUpsert("Donations", batch, list("Benevity_Donation_ID"));
+	}
+
+	// Compute the next cursor.
+	links = ifnull(resp.get("links"), Map());
+	nextLink = links.get("next");
+	if(nextLink == null)
+	{
+		nextLink = links.get("after");
+	}
+	if(nextLink != null && nextLink.contains("href"))
+	{
+		nextLink = nextLink.get("href");
+	}
+	nextUrl = nextLink;
+}
+
+// --- Persist progress for the next scheduled run. ---
+if(nextUrl == null || nextUrl == "")
+{
+	// Reached the end of the full data set. Clear the cursor so the next run
+	// starts a fresh pass (picking up any newly added donations).
+	saveCursor(stateName, "");
+	info "COMPLETED full pass. Fetched this run=" + totalFetched + ". Cursor cleared.";
+}
+else
+{
+	// More pages remain; save where to resume.
+	saveCursor(stateName, nextUrl);
+	info "Paused after " + pagesThisRun + " page(s). Fetched this run=" + totalFetched + ". Cursor saved for next run.";
+}
+
+
+/* ----- State helpers: read/write the cursor in Integration_State module ----- */
+String loadCursor(String name)
+{
+	criteria = "(Name:equals:" + name + ")";
+	rows = zoho.crm.searchRecords("Integration_State", criteria);
+	if(rows.size() > 0)
+	{
+		row = rows.get(0);
+		return ifnull(row.get("Cursor_URL"), "");
+	}
+	return "";
+}
+
+void saveCursor(String name, String cursorUrl)
+{
+	criteria = "(Name:equals:" + name + ")";
+	rows = zoho.crm.searchRecords("Integration_State", criteria);
+	updateMap = Map();
+	updateMap.put("Cursor_URL", cursorUrl);
+	if(rows.size() > 0)
+	{
+		recId = rows.get(0).get("id");
+		zoho.crm.updateRecord("Integration_State", recId, updateMap);
+	}
+	else
+	{
+		updateMap.put("Name", name);
+		zoho.crm.createRecord("Integration_State", updateMap);
+	}
+}
+
+
+/* ----- Same mapping as the simple version ----- */
+Map buildRecord(Map d)
+{
+	attrs = ifnull(d.get("attributes"), d);
+
+	donationId = d.get("id");
+	if(donationId == null)
+	{
+		donationId = attrs.get("id");
+	}
+	if(donationId == null)
+	{
+		donationId = attrs.get("donationId");
+	}
+
+	amount = null;
+	currency = null;
+	amtObj = attrs.get("amount");
+	if(amtObj != null && amtObj.containKey("value"))
+	{
+		amount = amtObj.get("value");
+		currency = amtObj.get("currency");
+	}
+	else
+	{
+		amount = ifnull(attrs.get("donationAmount"), attrs.get("amount"));
+		currency = ifnull(attrs.get("currency"), attrs.get("currencyCode"));
+	}
+
+	status = null;
+	stateObj = attrs.get("state");
+	if(stateObj != null && stateObj.containKey("processingStatus"))
+	{
+		status = stateObj.get("processingStatus");
+	}
+	else
+	{
+		status = ifnull(attrs.get("status"), attrs.get("processingStatus"));
+	}
+
+	donationDate = ifnull(attrs.get("createdAt"), ifnull(attrs.get("donationDate"), attrs.get("created")));
+
+	causeId = ifnull(attrs.get("recipientId"), attrs.get("causeId"));
+	causeName = null;
+	causeObj = attrs.get("cause");
+	if(causeObj != null)
+	{
+		causeName = causeObj.get("name");
+	}
+	if(causeName == null)
+	{
+		causeName = attrs.get("causeName");
+	}
+
+	paymentType = null;
+	payable = attrs.get("payable");
+	if(payable != null)
+	{
+		paymentType = payable.get("paymentType");
+	}
+	if(paymentType == null)
+	{
+		paymentType = attrs.get("paymentType");
+	}
+
+	donor = ifnull(attrs.get("donor"), attrs.get("user"));
+	donorFirst = null;
+	donorLast = null;
+	donorEmail = null;
+	if(donor != null)
+	{
+		donorFirst = ifnull(donor.get("firstName"), donor.get("first_name"));
+		donorLast = ifnull(donor.get("lastName"), donor.get("last_name"));
+		donorEmail = ifnull(donor.get("email"), donor.get("emailAddress"));
+	}
+
+	rec = Map();
+	if(donationId != null)
+	{
+		rec.put("Name", "Donation " + donationId);
+		rec.put("Benevity_Donation_ID", donationId.toString());
+	}
+	if(amount != null)
+	{
+		rec.put("Amount", amount);
+	}
+	if(currency != null)
+	{
+		rec.put("Currency_Code", currency);
+	}
+	if(status != null)
+	{
+		rec.put("Donation_Status", status);
+	}
+	if(donationDate != null)
+	{
+		rec.put("Donation_Date", donationDate);
+	}
+	if(causeId != null)
+	{
+		rec.put("Cause_ID", causeId);
+	}
+	if(causeName != null)
+	{
+		rec.put("Cause_Name", causeName);
+	}
+	if(paymentType != null)
+	{
+		rec.put("Payment_Type", paymentType);
+	}
+	if(donorFirst != null)
+	{
+		rec.put("Donor_First_Name", donorFirst);
+	}
+	if(donorLast != null)
+	{
+		rec.put("Donor_Last_Name", donorLast);
+	}
+	if(donorEmail != null)
+	{
+		rec.put("Donor_Email", donorEmail);
+	}
+	return rec;
+}
